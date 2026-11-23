@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import * as http from 'http';
 import { Horizon, Server } from '@stellar/stellar-sdk';
 
 export interface HorizonListenerConfig {
@@ -12,6 +13,15 @@ export interface HorizonListenerConfig {
   topicFilter?: string[];
   pollIntervalMs?: number;
   cursor?: string;
+  /**
+   * Optional health server. Disabled unless `healthPort` is set. When enabled,
+   * `GET /healthz` reports process liveness and `GET /readyz` reports readiness
+   * (200 only when listener lag is under `readyLagThresholdMs`).
+   */
+  healthPort?: number;
+  healthHost?: string;
+  /** Max acceptable lag (ms) for `/readyz` to report ready. Defaults to 30000. */
+  readyLagThresholdMs?: number;
 }
 
 export interface ContractEvent {
@@ -54,6 +64,8 @@ export class HorizonListener extends EventEmitter {
   private cursor?: string;
   private timer?: NodeJS.Timeout;
   private running = false;
+  private lastPollAt?: number;
+  private healthServer?: http.Server;
 
   constructor(config: HorizonListenerConfig) {
     super();
@@ -70,6 +82,7 @@ export class HorizonListener extends EventEmitter {
       return;
     }
     this.running = true;
+    this.startHealthServer();
     void this.poll();
   }
 
@@ -79,6 +92,55 @@ export class HorizonListener extends EventEmitter {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
+    this.stopHealthServer();
+  }
+
+  private startHealthServer(): void {
+    if (this.config.healthPort === undefined || this.healthServer) {
+      return;
+    }
+    this.healthServer = http.createServer((req, res) => {
+      const url = req.url ?? '';
+      if (req.method !== 'GET') {
+        res.statusCode = 405;
+        res.end();
+        return;
+      }
+      if (url === '/healthz') {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ status: 'ok' }));
+        return;
+      }
+      if (url === '/readyz') {
+        const ready = this.isReady();
+        res.statusCode = ready ? 200 : 503;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ status: ready ? 'ready' : 'not_ready' }));
+        return;
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    this.healthServer.listen(
+      this.config.healthPort,
+      this.config.healthHost,
+    );
+  }
+
+  private stopHealthServer(): void {
+    if (this.healthServer) {
+      this.healthServer.close();
+      this.healthServer = undefined;
+    }
+  }
+
+  private isReady(): boolean {
+    if (!this.running || this.lastPollAt === undefined) {
+      return false;
+    }
+    const threshold = this.config.readyLagThresholdMs ?? 30000;
+    return Date.now() - this.lastPollAt <= threshold;
   }
 
   private async poll(): Promise<void> {
@@ -87,6 +149,7 @@ export class HorizonListener extends EventEmitter {
     }
     try {
       await this.fetchEvents();
+      this.lastPollAt = Date.now();
     } catch (err) {
       this.emit('error', err);
     } finally {
